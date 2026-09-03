@@ -1,7 +1,23 @@
 // api/pharmgkb.js
-// Fetches REAL data from PharmGKB and CPIC
+// Fetches REAL data from PharmGKB (now ClinPGx) and CPIC
 // Zero LLM involvement — returns raw structured data
 // Frontend displays exactly what databases return
+//
+// Two infrastructure changes broke this file entirely (verified against the
+// live APIs, Sept 2026):
+// 1. api.pharmgkb.org was retired 2026-07-20. Same paths/response shapes,
+//    new hostname: api.clinpgx.org.
+//    See: https://blog.clinpgx.org/retiring-the-api-pharmgkb-org-hostname/
+// 2. CPIC's `pair` table schema changed (v1.55.0, 2026-03-13). The columns
+//    this file used to filter/select (drugname, genename, cpicStatus, level,
+//    url) no longer exist. Current schema: `drug` has {drugid, name}, `pair`
+//    has {drugid, genesymbol, cpiclevel, pgxtesting, guidelineid} — no drug
+//    name or url on `pair` itself, so drug-name lookup and the guideline URL
+//    now require two extra joins (drug -> pair -> guideline).
+//    See: https://blog.clinpgx.org/updates-to-the-cpic-database-and-api/
+
+const PHARMGKB_BASE = "https://api.clinpgx.org";
+const CPIC_BASE = "https://api.cpicpgx.org";
 
 module.exports = async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -14,14 +30,16 @@ module.exports = async function handler(req, res) {
     search_term: searchTerm,
     pharmgkb: null,
     cpic_guidelines: [],
+    cpic_pairs: [],
     variant_annotations: [],
     sources: {},
     data_found: false,
+    fetch_errors: [],  // surfaced instead of silently swallowed
   };
 
-  // 1. Search PharmGKB for the chemical/drug
+  // 1. Search PharmGKB/ClinPGx for the chemical/drug
   try {
-    const searchUrl = `https://api.pharmgkb.org/v1/data/chemical?view=base&name=${encodeURIComponent(searchTerm)}`;
+    const searchUrl = `${PHARMGKB_BASE}/v1/data/chemical?view=base&name=${encodeURIComponent(searchTerm)}`;
     const searchRes = await fetch(searchUrl, { headers: { "Accept": "application/json" } });
 
     if (searchRes.ok) {
@@ -33,14 +51,14 @@ module.exports = async function handler(req, res) {
         results.pharmgkb = {
           id: chem.id,
           name: chem.name,
-          url: `https://www.pharmgkb.org/chemical/${chem.id}`,
+          url: `https://www.clinpgx.org/chemical/${chem.id}`,
         };
         results.data_found = true;
         results.sources.pharmgkb = results.pharmgkb.url;
 
-        // 2. Fetch CPIC guidelines for this drug
+        // 2. Fetch CPIC/clinical guidelines for this drug
         try {
-          const guidelinesUrl = `https://api.pharmgkb.org/v1/data/guideline?relatedChemicals.id=${chem.id}&view=base`;
+          const guidelinesUrl = `${PHARMGKB_BASE}/v1/data/guideline?relatedChemicals.id=${chem.id}&view=base`;
           const guidelinesRes = await fetch(guidelinesUrl, { headers: { "Accept": "application/json" } });
           if (guidelinesRes.ok) {
             const guidelinesData = await guidelinesRes.json();
@@ -48,14 +66,18 @@ module.exports = async function handler(req, res) {
               name: g.name,
               source: g.source,
               id: g.id,
-              url: g.id ? `https://www.pharmgkb.org/guideline/${g.id}` : null,
+              url: g.id ? `https://www.clinpgx.org/guideline/${g.id}` : null,
             }));
+          } else {
+            results.fetch_errors.push(`PharmGKB guidelines: HTTP ${guidelinesRes.status}`);
           }
-        } catch (e) { /* optional */ }
+        } catch (e) {
+          results.fetch_errors.push(`PharmGKB guidelines: ${e.message}`);
+        }
 
         // 3. Fetch variant annotations
         try {
-          const varUrl = `https://api.pharmgkb.org/v1/data/variantAnnotation?relatedChemicals.id=${chem.id}&view=base&pageSize=20`;
+          const varUrl = `${PHARMGKB_BASE}/v1/data/variantAnnotation?relatedChemicals.id=${chem.id}&view=base&pageSize=20`;
           const varRes = await fetch(varUrl, { headers: { "Accept": "application/json" } });
           if (varRes.ok) {
             const varData = await varRes.json();
@@ -72,31 +94,74 @@ module.exports = async function handler(req, res) {
                 (v.studyParameters?.[0]?.populationEthnicity || "").toLowerCase().includes(k.toLowerCase())
               ) || false,
             }));
+          } else {
+            results.fetch_errors.push(`PharmGKB variant annotations: HTTP ${varRes.status}`);
           }
-        } catch (e) { /* optional */ }
+        } catch (e) {
+          results.fetch_errors.push(`PharmGKB variant annotations: ${e.message}`);
+        }
       }
+    } else {
+      results.fetch_errors.push(`PharmGKB chemical search: HTTP ${searchRes.status}`);
     }
   } catch (e) {
+    results.fetch_errors.push(`PharmGKB chemical search: ${e.message}`);
     console.error("PharmGKB error:", e.message);
   }
 
-  // 4. CPIC direct API — drug-gene pairs with evidence
+  // 4. CPIC direct API — drug-gene pairs with evidence.
+  // `pair` no longer carries a drug name or a URL directly — resolve the
+  // drug name to its drugid first, then join guideline for the URL.
   try {
-    const cpicUrl = `https://api.cpicpgx.org/v1/pair?drugname=ilike.*${encodeURIComponent(searchTerm)}*&select=drugname,genename,cpicStatus,level,url`;
-    const cpicRes = await fetch(cpicUrl, { headers: { "Accept": "application/json" } });
-    if (cpicRes.ok) {
-      const cpicData = await cpicRes.json();
-      results.cpic_pairs = (cpicData || []).map(p => ({
-        drug: p.drugname,
-        gene: p.genename,
-        cpic_level: p.level,        // A/B/C/D — strength of evidence
-        cpic_status: p.cpicStatus,  // "CPIC Guideline" / "Informative PGx"
-        url: p.url,
-      }));
-      if (results.cpic_pairs.length > 0) results.data_found = true;
-      results.sources.cpic = "https://cpicpgx.org/genes-drugs/";
+    const drugUrl = `${CPIC_BASE}/v1/drug?name=ilike.*${encodeURIComponent(searchTerm)}*&select=drugid,name`;
+    const drugRes = await fetch(drugUrl, { headers: { "Accept": "application/json" } });
+
+    if (drugRes.ok) {
+      const drugs = await drugRes.json();
+
+      if (Array.isArray(drugs) && drugs.length > 0) {
+        const drugIdList = drugs.map(d => d.drugid);
+        const drugNameById = Object.fromEntries(drugs.map(d => [d.drugid, d.name]));
+        const idFilter = drugIdList.map(id => encodeURIComponent(id)).join(",");
+
+        const pairUrl = `${CPIC_BASE}/v1/pair?drugid=in.(${idFilter})&removed=eq.false&select=drugid,genesymbol,cpiclevel,pgxtesting,guidelineid`;
+        const pairRes = await fetch(pairUrl, { headers: { "Accept": "application/json" } });
+
+        if (pairRes.ok) {
+          const pairs = await pairRes.json();
+
+          // Resolve guideline URLs for whichever pairs have one
+          const guidelineIds = [...new Set(pairs.map(p => p.guidelineid).filter(Boolean))];
+          let guidelineById = {};
+          if (guidelineIds.length > 0) {
+            const guidelineUrl = `${CPIC_BASE}/v1/guideline?id=in.(${guidelineIds.join(",")})&select=id,name,url`;
+            const guidelineRes = await fetch(guidelineUrl, { headers: { "Accept": "application/json" } });
+            if (guidelineRes.ok) {
+              const guidelines = await guidelineRes.json();
+              guidelineById = Object.fromEntries(guidelines.map(g => [g.id, g]));
+            } else {
+              results.fetch_errors.push(`CPIC guideline lookup: HTTP ${guidelineRes.status}`);
+            }
+          }
+
+          results.cpic_pairs = pairs.map(p => ({
+            drug: drugNameById[p.drugid] || searchTerm,
+            gene: p.genesymbol,
+            cpic_level: p.cpiclevel,        // A/B/C/D — strength of evidence
+            cpic_status: p.pgxtesting,      // e.g. "Actionable PGx" / "Informative PGx"
+            url: guidelineById[p.guidelineid]?.url || null,
+          }));
+          if (results.cpic_pairs.length > 0) results.data_found = true;
+          results.sources.cpic = "https://cpicpgx.org/genes-drugs/";
+        } else {
+          results.fetch_errors.push(`CPIC pair lookup: HTTP ${pairRes.status}`);
+        }
+      }
+    } else {
+      results.fetch_errors.push(`CPIC drug lookup: HTTP ${drugRes.status}`);
     }
   } catch (e) {
+    results.fetch_errors.push(`CPIC: ${e.message}`);
     console.error("CPIC error:", e.message);
   }
 

@@ -333,7 +333,11 @@ export default function OpenDrugTrials() {
                     <WarningBanner text="No drug entered, and no well-established standard drug could be confidently identified for this condition. Enter a drug name to see pharmacogenomics data." />
                   )}
 
-                  {pharmData.drug_source !== "none" && !pharmData.data_found && (
+                  {pharmData.fetch_errors?.length > 0 && (
+                    <WarningBanner text={`PharmGKB/CPIC request(s) failed — this is not "no data", the fetch itself errored: ${pharmData.fetch_errors.join("; ")}`} />
+                  )}
+
+                  {pharmData.drug_source !== "none" && !pharmData.fetch_errors?.length && !pharmData.data_found && (
                     <WarningBanner text={`No PharmGKB data found for "${pharmData.search_term}". This drug may not yet have pharmacogenomics data, or try a more specific drug name.`} />
                   )}
 
