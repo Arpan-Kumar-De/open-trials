@@ -123,8 +123,41 @@ export default function OpenDrugTrials() {
       setParsed(identityParams);
 
       // Step 1 — PharmGKB real data
+      // PharmGKB only indexes drugs, not conditions — searching it with a
+      // condition name (e.g. "Psoriasis") never matches anything. If no drug
+      // was entered, fall back to a drug Claude suggested during identity
+      // parsing (only when there's a clear, uncontroversial standard
+      // treatment — see api/parse-identity.js). The pharmacogenomics data
+      // itself is still 100% real PharmGKB/CPIC data either way; only the
+      // choice of *which drug* to look up is AI-assisted, and it's labelled
+      // as such below.
       setStatusMsg("Querying PharmGKB database...");
-      const pharm = await fetchPharmGKB(drug, condition, identityParams.ancestry_keywords);
+      const userDrug = drug.trim();
+      const drugToUse = userDrug || identityParams.suggested_drug || "";
+      let pharm;
+      if (drugToUse) {
+        pharm = await fetchPharmGKB(drugToUse, condition, identityParams.ancestry_keywords);
+        pharm.drug_used = drugToUse;
+        pharm.drug_source = userDrug ? "user_provided" : "claude_suggested";
+      } else {
+        pharm = {
+          search_term: condition,
+          pharmgkb: null,
+          cpic_guidelines: [],
+          cpic_pairs: [],
+          variant_annotations: [],
+          sources: {},
+          data_found: false,
+          drug_used: null,
+          drug_source: "none",
+          ancestry_representation: {
+            total_variant_studies: 0,
+            studies_with_ancestry_match: 0,
+            percentage: null,
+            note: "No drug specified, and no well-established standard drug could be identified for this condition.",
+          },
+        };
+      }
       setPharmData(pharm);
 
       // Step 2 — ClinicalTrials.gov real data
@@ -292,7 +325,15 @@ export default function OpenDrugTrials() {
 
               {pharmData && (
                 <div style={{ animation: "fadeUp 0.3s ease" }}>
-                  {!pharmData.data_found && (
+                  {pharmData.drug_source === "claude_suggested" && (
+                    <InfoBanner text={`No drug entered — Claude suggested "${pharmData.drug_used}" as a well-established standard treatment for this condition. The pharmacogenomics data below is real PharmGKB/CPIC data for that drug; only the choice of drug name is AI-suggested, not the data.`} />
+                  )}
+
+                  {pharmData.drug_source === "none" && (
+                    <WarningBanner text="No drug entered, and no well-established standard drug could be confidently identified for this condition. Enter a drug name to see pharmacogenomics data." />
+                  )}
+
+                  {pharmData.drug_source !== "none" && !pharmData.data_found && (
                     <WarningBanner text={`No PharmGKB data found for "${pharmData.search_term}". This drug may not yet have pharmacogenomics data, or try a more specific drug name.`} />
                   )}
 
