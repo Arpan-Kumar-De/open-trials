@@ -4,22 +4,63 @@
 // Return structured params to query real databases
 // No scoring. No ranking. No interpretation. Just extraction.
 
+// This is the only endpoint that spends money (it calls the Anthropic API
+// with your own ANTHROPIC_API_KEY) — the rest of the app only calls free,
+// unauthenticated public data sources. Two things were wrong here before:
+//
+// 1. `x-forwarded-for` was read as the FIRST entry in the header. Vercel's
+//    edge appends the real client IP as the LAST entry; anything before
+//    that can be set by the client itself. Reading the first entry meant
+//    anyone could bypass the per-IP limit just by sending their own
+//    X-Forwarded-For header.
+// 2. There was no cap on total volume across all IPs — a botnet or a lot
+//    of distinct visitors could still add up to a large bill even with a
+//    correctly-enforced per-IP limit.
+//
+// Caveat that no in-memory approach fixes: Vercel serverless functions are
+// stateless between cold starts and not shared across concurrent instances,
+// so this counter can reset or fragment under real traffic. It raises the
+// bar significantly but is not a hard guarantee — the actual safety net is
+// setting a spend/usage cap on the Anthropic API key itself, in the
+// Anthropic console, which no amount of code here can substitute for.
 const rateLimitMap = new Map();
+const globalRequestLog = [];
+
+function clientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (!forwarded) return "unknown";
+  const hops = forwarded.split(",").map(h => h.trim());
+  return hops[hops.length - 1] || "unknown"; // last hop = Vercel's own, not client-spoofable
+}
+
 function isRateLimited(ip) {
   const now = Date.now();
   const windowMs = 60 * 60 * 1000;
-  const max = 30;
+  const perIpMax = 10;      // was 30 — tightened
+  const globalMax = 150;    // new — hard cap across all IPs combined
+
+  // Global circuit breaker
+  while (globalRequestLog.length > 0 && now - globalRequestLog[0] > windowMs) {
+    globalRequestLog.shift();
+  }
+  if (globalRequestLog.length >= globalMax) return true;
+
+  // Per-IP limit
   if (!rateLimitMap.has(ip)) rateLimitMap.set(ip, []);
   const timestamps = rateLimitMap.get(ip).filter(t => now - t < windowMs);
+  if (timestamps.length >= perIpMax) return true;
+
+  // Only record the request once both checks have passed
   timestamps.push(now);
   rateLimitMap.set(ip, timestamps);
-  return timestamps.length > max;
+  globalRequestLog.push(now);
+  return false;
 }
 
 module.exports = async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const ip = req.headers["x-forwarded-for"]?.split(",")[0] || "unknown";
+  const ip = clientIp(req);
   if (isRateLimited(ip)) return res.status(429).json({ error: "Too many requests." });
   if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: "API key not configured." });
 
