@@ -4,6 +4,28 @@
 // Engine 2: diversity from completed trial results
 // Engine 3: matching via hard filters + keyword search
 
+// ClinicalTrials.gov API v2 has no `filter.sex` or bare-number `filter.advanced`
+// age-range parameter — sending either causes the API to reject the whole
+// request, which the old code swallowed silently and displayed as "no trials
+// found" (see api/parse-identity.js consumers). Sex and age are filtered
+// client-side instead, against the eligibilityModule fields the API already
+// returns for every study.
+// See: https://clinicaltrials.gov/data-api/api (full parameter list)
+
+// Converts ClinicalTrials.gov age strings ("18 Years", "6 Months", "N/A") to
+// a number of years, or null when unknown/unbounded.
+function parseAgeYears(ageStr) {
+  if (!ageStr || typeof ageStr !== "string") return null;
+  const match = ageStr.match(/(\d+)\s*(Year|Month|Week|Day)/i);
+  if (!match) return null;
+  const value = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  if (unit.startsWith("year")) return value;
+  if (unit.startsWith("month")) return value / 12;
+  if (unit.startsWith("week")) return value / 52;
+  return value / 365;
+}
+
 module.exports = async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -19,21 +41,20 @@ module.exports = async function handler(req, res) {
   const baseUrl = "https://clinicaltrials.gov/api/v2/studies";
   const conditionEncoded = encodeURIComponent(condition);
 
+  // Patient's effective age range, if any was extracted. A single bound
+  // (only min or only max given) is treated as a specific age.
+  const patientMin = min_age ?? max_age ?? null;
+  const patientMax = max_age ?? min_age ?? null;
+
   // ── ENGINE 3: Recruiting trials matched to this person ──────────
   let recruiting = [];
   let totalRecruiting = 0;
+  let recruitingError = null;
 
   try {
-    // Build structured query — hard filters only, no LLM
-    let url = `${baseUrl}?query.cond=${conditionEncoded}&filter.overallStatus=RECRUITING&pageSize=25`;
-
-    // Hard filter on sex if specified
-    if (sex && sex !== "ALL") {
-      url += `&filter.sex=${sex}`;
-    }
-
-    // Hard filter on age if specified
-    if (min_age) url += `&filter.advanced=AREA[MinimumAge]RANGE[1,${min_age}]`;
+    // Only send parameters the API v2 spec actually documents — condition
+    // and status. Sex/age are hard filters applied below, client-side.
+    let url = `${baseUrl}?query.cond=${conditionEncoded}&filter.overallStatus=RECRUITING&pageSize=100`;
 
     const fields = "NCTId,BriefTitle,Phase,OverallStatus,EligibilityModule,ContactsLocationsModule,DesignModule,BriefSummary,StatusModule";
     url += `&fields=${fields}`;
@@ -45,7 +66,7 @@ module.exports = async function handler(req, res) {
       totalRecruiting = recruitingData.totalCount || 0;
       const studies = recruitingData.studies || [];
 
-      recruiting = studies.map(study => {
+      const allMapped = studies.map(study => {
         const proto = study.protocolSection || {};
         const id = proto.identificationModule || {};
         const status = proto.statusModule || {};
@@ -77,17 +98,47 @@ module.exports = async function handler(req, res) {
           url: `https://clinicaltrials.gov/study/${id.nctId}`,
         };
       });
+
+      // Hard filter on sex, applied to the real eligibilityModule.sex value
+      const sexFiltered = (sex && sex !== "ALL")
+        ? allMapped.filter(t => t.sex_eligibility === "ALL" || t.sex_eligibility === sex)
+        : allMapped;
+
+      // Hard filter on age, applied to the real min/max eligibility ages —
+      // only when the person's description actually included an age
+      const ageFiltered = (patientMin !== null || patientMax !== null)
+        ? sexFiltered.filter(t => {
+            const tMin = parseAgeYears(t.min_age) ?? 0;
+            const tMax = parseAgeYears(t.max_age) ?? Infinity;
+            const pMin = patientMin ?? 0;
+            const pMax = patientMax ?? Infinity;
+            return pMax >= tMin && pMin <= tMax;
+          })
+        : sexFiltered;
+
+      recruiting = ageFiltered.slice(0, 25);
+    } else {
+      const bodyText = await recruitingRes.text();
+      recruitingError = `ClinicalTrials.gov returned ${recruitingRes.status}: ${bodyText.slice(0, 300)}`;
+      console.error("Recruiting fetch error:", recruitingError);
     }
   } catch (e) {
+    recruitingError = e.message;
     console.error("Recruiting fetch error:", e.message);
   }
 
   // ── ENGINE 2: Diversity from COMPLETED trials with results ──────
   let completedWithDemographics = [];
   let diversityStats = null;
+  let completedError = null;
 
   try {
-    const completedUrl = `${baseUrl}?query.cond=${conditionEncoded}&filter.overallStatus=COMPLETED&filter.resultsFirstPostDate=2017-01-01,${new Date().toISOString().split("T")[0]}&pageSize=20&fields=NCTId,BriefTitle,ResultsSection,EligibilityModule`;
+    // `filter.resultsFirstPostDate` is not a documented API v2 parameter
+    // either — sending it 400s the request the same way filter.sex did.
+    // Recency isn't load-bearing here: we only keep studies that actually
+    // have a resultsSection below, so dropping the date filter just widens
+    // the pool instead of silently returning zero.
+    const completedUrl = `${baseUrl}?query.cond=${conditionEncoded}&filter.overallStatus=COMPLETED&pageSize=50&fields=NCTId,BriefTitle,ResultsSection,EligibilityModule`;
     const completedRes = await fetch(completedUrl, { headers: { "Accept": "application/json" } });
 
     if (completedRes.ok) {
@@ -164,8 +215,13 @@ module.exports = async function handler(req, res) {
           title: s.protocolSection?.identificationModule?.briefTitle,
           has_demographics: true,
         }));
+    } else {
+      const bodyText = await completedRes.text();
+      completedError = `ClinicalTrials.gov returned ${completedRes.status}: ${bodyText.slice(0, 300)}`;
+      console.error("Completed trials fetch error:", completedError);
     }
   } catch (e) {
+    completedError = e.message;
     console.error("Completed trials fetch error:", e.message);
   }
 
@@ -175,16 +231,25 @@ module.exports = async function handler(req, res) {
       trials: recruiting,
       total_count: totalRecruiting,
       diversity_keyword_matches: recruiting.filter(t => t.seeks_diverse).length,
-      filters_applied: { sex, min_age, max_age, keywords: allKeywords },
+      filters_applied: {
+        sex, min_age, max_age, keywords: allKeywords,
+        method: "sex and age are filtered client-side against ClinicalTrials.gov's own eligibility fields — the API has no filter.sex or bare-number age parameter",
+      },
+      // Surfaced instead of silently swallowed — a fetch failure should never
+      // look identical to "genuinely zero trials match".
+      fetch_error: recruitingError,
     },
     // Engine 2 — diversity
     diversity: {
       stats: diversityStats,
       completed_with_results: completedWithDemographics.length,
       data_available: !!diversityStats,
-      note: !diversityStats ?
+      note: completedError ?
+        `Could not fetch completed-trial results from ClinicalTrials.gov: ${completedError}` :
+        !diversityStats ?
         "No structured demographic data found in completed trial results for this condition. This itself reflects the reporting gap — most trials do not submit demographic breakdowns." :
         `Based on ${diversityStats.trials_with_demographics} completed trials that reported participant demographics.`,
+      fetch_error: completedError,
     },
     source: "ClinicalTrials.gov API v2",
     fetched_at: new Date().toISOString(),

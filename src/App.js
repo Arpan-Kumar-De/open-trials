@@ -387,7 +387,9 @@ export default function OpenDrugTrials() {
 
                 {trialData && (
                   <div style={{ animation: "fadeUp 0.3s ease" }}>
-                    {!div.data_available ? (
+                    {div.fetch_error ? (
+                      <WarningBanner text={`ClinicalTrials.gov request failed — this is not "no data", the fetch itself errored: ${div.fetch_error}`} />
+                    ) : !div.data_available ? (
                       <div>
                         <WarningBanner text="No demographic breakdown data found in completed trial results for this condition." />
                         <div style={{ background: "#f8f9fa", borderRadius: 8, padding: 16, fontSize: 14, color: "#202124", lineHeight: 1.7 }}>
@@ -452,7 +454,9 @@ export default function OpenDrugTrials() {
                   </div>
                 )}
 
-                {rec.trials?.length === 0 && (
+                {rec.fetch_error ? (
+                  <WarningBanner text={`ClinicalTrials.gov request failed — this is not "no trials", the fetch itself errored: ${rec.fetch_error}`} />
+                ) : rec.trials?.length === 0 && (
                   <WarningBanner text="No recruiting trials found matching your filters. Try broadening your search." />
                 )}
 
