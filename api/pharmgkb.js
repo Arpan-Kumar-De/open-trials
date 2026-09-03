@@ -56,44 +56,39 @@ module.exports = async function handler(req, res) {
         results.data_found = true;
         results.sources.pharmgkb = results.pharmgkb.url;
 
-        // 2. Fetch CPIC/clinical guidelines for this drug
+        // 2. Fetch variant annotations. Confirmed live against the real API
+        // (Sept 2026): the chemical-relation filter key is `accessionId`,
+        // not `id`; gene/variant names live under `location`, not
+        // `relatedGenes`/`variant`; `significance` is a term-object with a
+        // `.term` string, not a plain value; and `populationEthnicity` is an
+        // object with an `.ethnicities` array, not a string — the old code
+        // called `.toLowerCase()` on that object, which would have thrown.
+        // (The old `/v1/data/guideline?relatedChemicals...` call is dropped
+        // below — same 400, and CPIC's own guideline data, fetched during
+        // the pair lookup, covers the same information.)
         try {
-          const guidelinesUrl = `${PHARMGKB_BASE}/v1/data/guideline?relatedChemicals.id=${chem.id}&view=base`;
-          const guidelinesRes = await fetch(guidelinesUrl, { headers: { "Accept": "application/json" } });
-          if (guidelinesRes.ok) {
-            const guidelinesData = await guidelinesRes.json();
-            results.cpic_guidelines = (guidelinesData.data || []).map(g => ({
-              name: g.name,
-              source: g.source,
-              id: g.id,
-              url: g.id ? `https://www.clinpgx.org/guideline/${g.id}` : null,
-            }));
-          } else {
-            results.fetch_errors.push(`PharmGKB guidelines: HTTP ${guidelinesRes.status}`);
-          }
-        } catch (e) {
-          results.fetch_errors.push(`PharmGKB guidelines: ${e.message}`);
-        }
-
-        // 3. Fetch variant annotations
-        try {
-          const varUrl = `${PHARMGKB_BASE}/v1/data/variantAnnotation?relatedChemicals.id=${chem.id}&view=base&pageSize=20`;
+          const varUrl = `${PHARMGKB_BASE}/v1/data/variantAnnotation?relatedChemicals.accessionId=${chem.id}&view=base`;
           const varRes = await fetch(varUrl, { headers: { "Accept": "application/json" } });
           if (varRes.ok) {
             const varData = await varRes.json();
-            results.variant_annotations = (varData.data || []).map(v => ({
-              gene: v.relatedGenes?.[0]?.symbol || null,
-              variant: v.variant?.name || null,
-              significance: v.significance || null,
-              evidence_level: v.evidenceLevel || null,
-              // Population data where available
-              study_population: v.studyParameters?.[0]?.studySubjects || null,
-              ethnicity: v.studyParameters?.[0]?.populationEthnicity || null,
-              // Flag if ancestry keywords match
-              ancestry_match: ancestry_keywords?.some(k =>
-                (v.studyParameters?.[0]?.populationEthnicity || "").toLowerCase().includes(k.toLowerCase())
-              ) || false,
-            }));
+            results.variant_annotations = (varData.data || []).slice(0, 20).map(v => {
+              const sp = v.studyParameters?.[0] || {};
+              const ethnicities = sp.populationEthnicity?.ethnicities || [];
+              return {
+                gene: v.location?.genes?.[0]?.symbol || null,
+                variant: v.location?.rsid || v.location?.displayName || null,
+                significance: v.significance?.term || null,
+                summary: v.sentence || null,
+                study_population: (sp.studyCases != null || sp.studyControls != null)
+                  ? { cases: sp.studyCases ?? null, controls: sp.studyControls ?? null }
+                  : null,
+                ethnicity: ethnicities.length > 0 ? ethnicities.join(", ") : null,
+                // Flag if ancestry keywords match
+                ancestry_match: ancestry_keywords?.some(k =>
+                  ethnicities.some(e => e.toLowerCase().includes(k.toLowerCase()))
+                ) || false,
+              };
+            });
           } else {
             results.fetch_errors.push(`PharmGKB variant annotations: HTTP ${varRes.status}`);
           }
@@ -153,6 +148,16 @@ module.exports = async function handler(req, res) {
           }));
           if (results.cpic_pairs.length > 0) results.data_found = true;
           results.sources.cpic = "https://cpicpgx.org/genes-drugs/";
+
+          // Reuse the guidelines already resolved above, deduped, instead of
+          // a separate PharmGKB guideline call (that endpoint 400s on this
+          // filter and isn't worth a second unverified guess at its syntax).
+          results.cpic_guidelines = Object.values(guidelineById).map(g => ({
+            name: g.name,
+            source: "CPIC",
+            id: g.id,
+            url: g.url || null,
+          }));
         } else {
           results.fetch_errors.push(`CPIC pair lookup: HTTP ${pairRes.status}`);
         }
