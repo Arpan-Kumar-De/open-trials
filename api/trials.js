@@ -54,7 +54,9 @@ module.exports = async function handler(req, res) {
   try {
     // Only send parameters the API v2 spec actually documents — condition
     // and status. Sex/age are hard filters applied below, client-side.
-    let url = `${baseUrl}?query.cond=${conditionEncoded}&filter.overallStatus=RECRUITING&pageSize=100`;
+    // countTotal=true is required — otherwise the API omits totalCount
+    // entirely and it silently reads as 0, even when trials actually match.
+    let url = `${baseUrl}?query.cond=${conditionEncoded}&filter.overallStatus=RECRUITING&pageSize=100&countTotal=true`;
 
     const fields = "NCTId,BriefTitle,Phase,OverallStatus,EligibilityModule,ContactsLocationsModule,DesignModule,BriefSummary,StatusModule";
     url += `&fields=${fields}`;
@@ -138,7 +140,7 @@ module.exports = async function handler(req, res) {
     // Recency isn't load-bearing here: we only keep studies that actually
     // have a resultsSection below, so dropping the date filter just widens
     // the pool instead of silently returning zero.
-    const completedUrl = `${baseUrl}?query.cond=${conditionEncoded}&filter.overallStatus=COMPLETED&pageSize=50&fields=NCTId,BriefTitle,ResultsSection,EligibilityModule`;
+    const completedUrl = `${baseUrl}?query.cond=${conditionEncoded}&filter.overallStatus=COMPLETED&pageSize=50&countTotal=true&fields=NCTId,BriefTitle,ResultsSection,EligibilityModule`;
     const completedRes = await fetch(completedUrl, { headers: { "Accept": "application/json" } });
 
     if (completedRes.ok) {
