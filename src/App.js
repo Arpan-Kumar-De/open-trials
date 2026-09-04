@@ -187,6 +187,22 @@ const ProgressBar = ({ value, matches }) => (
 // Not a fabricated composite score — that would violate the app's own
 // "no scoring" premise. Just the three real facts, stated in plain language
 // together, instead of leaving the user to synthesize three raw data dumps.
+// Clinical trial phases are meaningless without context — "Phase 2" tells a
+// layperson nothing about how far along or how risky a trial is.
+function formatPhase(raw) {
+  if (!raw || raw === "Not specified") return null;
+  return raw.split(", ").map(p => p.replace("PHASE", "Phase ").replace("NA", "N/A")).join(", ");
+}
+function phaseGloss(raw) {
+  if (!raw) return null;
+  const p = raw.toUpperCase();
+  if (p.includes("PHASE1") && !p.includes("PHASE2")) return "earliest-stage safety testing";
+  if (p.includes("PHASE2") && !p.includes("PHASE3")) return "mid-stage testing";
+  if (p.includes("PHASE3")) return "late-stage testing, close to approval";
+  if (p.includes("PHASE4")) return "approved drug, monitored after release";
+  return null;
+}
+
 function buildVerdictFacts({ pharm, trials }) {
   const facts = [];
   const div = trials?.diversity;
@@ -205,7 +221,7 @@ function buildVerdictFacts({ pharm, trials }) {
   if (pharm?.fetch_errors?.length > 0 && !pharm?.data_found) {
     facts.push({ text: "Couldn't load PharmGKB/CPIC data — request failed, not \"no data.\"", tone: "danger" });
   } else if (ancestryRep?.percentage !== null && ancestryRep?.percentage !== undefined) {
-    facts.push({ text: `${ancestryRep.percentage}% of pharmacogenomic variant studies for ${pharm.search_term} included your ancestry group.`, tone: ancestryRep.percentage >= 15 ? "data" : "match" });
+    facts.push({ text: `${ancestryRep.percentage}% of genetic studies on ${pharm.search_term} included your ancestry group.`, tone: ancestryRep.percentage >= 15 ? "data" : "match" });
   }
 
   if (rec?.fetch_error) {
@@ -335,9 +351,6 @@ export default function OpenDrugTrials() {
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          {["PharmGKB", "CPIC", "ClinicalTrials.gov"].map(s => (
-            <Pill key={s} variant="data" small>{s}</Pill>
-          ))}
           {stage !== "input" && (
             <button onClick={reset} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 20, padding: "8px 18px", fontSize: 13, color: "var(--text-muted)", cursor: "pointer", fontFamily: "inherit", marginLeft: 8 }}>
               New search
@@ -356,8 +369,7 @@ export default function OpenDrugTrials() {
                 Does this treatment work for people like you?
               </h1>
               <p style={{ fontSize: "var(--fs-3)", color: "var(--text-muted)", margin: 0, lineHeight: 1.7 }}>
-                Real data from PharmGKB, CPIC and ClinicalTrials.gov.<br />
-                No AI guesses. No fabricated scores.
+                Real published data — not an AI guess, not a fabricated score.
               </p>
             </div>
 
@@ -454,7 +466,7 @@ export default function OpenDrugTrials() {
 
             {/* PHARMACOGENOMICS */}
             <Card style={{ marginBottom: 20, animation: "fadeUp 0.4s ease" }}>
-              <SectionHeader icon="flask" title="Pharmacogenomics" subtitle="PharmGKB & CPIC — gene-drug evidence" />
+              <SectionHeader icon="flask" title="Pharmacogenomics" subtitle="How your genes affect this drug, from real lab studies" />
 
               {pharmData.drug_source === "claude_suggested" && (
                 <Banner kind="info">No drug entered — Claude suggested <strong>{pharmData.drug_used}</strong> as a well-established standard treatment. The data below is real PharmGKB/CPIC data for that drug; only the drug choice is AI-suggested.</Banner>
@@ -471,13 +483,16 @@ export default function OpenDrugTrials() {
 
               {pharmData.cpic_pairs?.length > 0 && (
                 <div style={{ marginBottom: 16 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>CPIC gene-drug pairs <Pill variant="data" small>{pharmData.cpic_pairs.length} found</Pill></div>
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>CPIC gene-drug pairs <Pill variant="data" small>{pharmData.cpic_pairs.length} found</Pill></div>
+                  <div style={{ fontSize: 12, color: "var(--text-faint)", marginBottom: 10, lineHeight: 1.5 }}>
+                    A gene-drug pair means: your genes here can change how this drug works for you. CPIC's evidence level tells you how sure they are — A/B is strong, actionable evidence; C/D is weaker or preliminary.
+                  </div>
                   <div style={{ display: "grid", gap: 6 }}>
                     {pharmData.cpic_pairs.map((pair, i) => (
                       <div key={i} style={{ background: "var(--bg)", borderRadius: 8, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                         <div style={{ fontSize: 13 }}><strong>{pair.drug}</strong> <span style={{ color: "var(--text-faint)" }}>×</span> <strong style={{ color: "var(--data)" }}>{pair.gene}</strong></div>
                         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                          <Pill small>Level {pair.cpic_level}</Pill>
+                          <Pill variant={["A", "B"].includes(String(pair.cpic_level).toUpperCase()) ? "data" : "neutral"} small>Level {pair.cpic_level}</Pill>
                           {pair.url && <a href={pair.url} target="_blank" rel="noreferrer" style={{ fontSize: 12 }}>Guideline</a>}
                         </div>
                       </div>
@@ -501,7 +516,7 @@ export default function OpenDrugTrials() {
             {/* DIVERSITY */}
             {div && (
               <Card style={{ marginBottom: 20, animation: "fadeUp 0.4s ease" }}>
-                <SectionHeader icon="bars" title="Research diversity" subtitle="Demographics from completed trials that reported them" />
+                <SectionHeader icon="bars" title="Research diversity" subtitle="Who has actually been studied for this condition" />
 
                 {div.fetch_error ? (
                   <Banner kind="danger">Request failed — this is not "no data": {div.fetch_error}</Banner>
@@ -533,16 +548,16 @@ export default function OpenDrugTrials() {
             {/* TRIALS */}
             {rec && (
               <Card style={{ marginBottom: 20, animation: "fadeUp 0.4s ease" }}>
-                <SectionHeader icon="clipboard" title="Recruiting trials" subtitle="Live from ClinicalTrials.gov, filtered by your parameters" />
+                <SectionHeader icon="clipboard" title="Recruiting trials" subtitle="Trials currently enrolling that may fit you" />
 
                 <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
                   <div style={{ flex: 1, background: "var(--data-soft)", borderRadius: 8, padding: "12px 16px", textAlign: "center" }}>
                     <div style={{ fontSize: 24, fontWeight: 700, color: "var(--data)" }}>{(rec.total_count ?? 0).toLocaleString()}</div>
-                    <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>Recruiting worldwide</div>
+                    <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>Total recruiting worldwide</div>
                   </div>
                   <div style={{ flex: 1, background: "var(--match-soft)", borderRadius: 8, padding: "12px 16px", textAlign: "center" }}>
                     <div style={{ fontSize: 24, fontWeight: 700, color: "var(--match)" }}>{rec.trials?.length ?? 0}</div>
-                    <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>Match your sex/age</div>
+                    <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>Match your profile</div>
                   </div>
                 </div>
 
@@ -566,7 +581,7 @@ export default function OpenDrugTrials() {
                           <div style={{ flex: 1 }}>
                             <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
                               <span style={{ fontSize: 12, color: "var(--data)", fontWeight: 600 }}>{trial.id}</span>
-                              {trial.phase && <Pill small>{trial.phase}</Pill>}
+                              {trial.phase && <Pill small>{formatPhase(trial.phase) || trial.phase}</Pill>}
                               {trial.seeks_diverse && <Pill variant="match" small>Diversity keywords found</Pill>}
                             </div>
                             <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>{trial.title}</div>
@@ -574,6 +589,7 @@ export default function OpenDrugTrials() {
                               {trial.countries?.join(", ") || "Location not listed"}
                               {trial.sex_eligibility && trial.sex_eligibility !== "ALL" && ` · ${trial.sex_eligibility} only`}
                               {trial.min_age && ` · ${trial.min_age}${trial.max_age ? `–${trial.max_age}` : "+"}`}
+                              {phaseGloss(trial.phase) && ` · ${phaseGloss(trial.phase)}`}
                             </div>
                             {preview && <div style={{ fontSize: 12, color: "var(--text-faint)", marginTop: 6, lineHeight: 1.5 }}>{preview}{preview.length >= 180 ? "…" : ""}</div>}
                           </div>
@@ -607,7 +623,7 @@ export default function OpenDrugTrials() {
             <Card style={{ background: "var(--bg)", border: "1px solid var(--border)" }}>
               <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>What to do with this</div>
               <p style={{ fontSize: 13, color: "var(--text-muted)", lineHeight: 1.6, margin: "0 0 16px" }}>
-                This isn't medical advice. If a trial above looks like a fit, bring its NCT number to your doctor — they can confirm eligibility and next steps. Every number on this page links back to its real source, so you or your doctor can verify it independently.
+                This isn't medical advice. If a trial above looks like a fit, bring its ID — the code like NCT01234567 shown on the card — to your doctor; they can confirm eligibility and next steps. Every number on this page links back to its real source, so you or your doctor can verify it independently.
               </p>
               <button onClick={copyLink} style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 20, padding: "8px 18px", fontSize: 13, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>
                 <Icon name="link" size={14} />
